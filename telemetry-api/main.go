@@ -230,7 +230,7 @@ func getQpigs(w http.ResponseWriter, id int64) {
 
 func getHistory(w http.ResponseWriter, r *http.Request, id int64) {
 
-	limit := 50
+	limit := 10000
 	if l := r.URL.Query().Get("limit"); l != "" {
 		if parsed, err := strconv.Atoi(l); err == nil {
 			limit = parsed
@@ -240,8 +240,21 @@ func getHistory(w http.ResponseWriter, r *http.Request, id int64) {
 	rows, err := db.Query(context.Background(),
 		`SELECT time,
 		        ac_output_active_power,
+		        ac_output_apparent_power,
+		        ac_output_load,
+		        battery_capacity,
 		        battery_voltage,
-		        pv_input_power
+		        battery_charging_current,
+		        battery_discharge_current,
+		        pv_input_power,
+		        pv_input_voltage,
+		        pv_input_current_for_battery,
+		        ac_input_voltage,
+		        ac_input_frequency,
+		        inverter_heat_sink_temperature,
+				pv2_input_current,
+        		pv2_input_voltage,
+        		pv2_charging_power
 		 FROM telemetry
 		 WHERE inverter_id=$1
 		 ORDER BY time DESC
@@ -254,17 +267,48 @@ func getHistory(w http.ResponseWriter, r *http.Request, id int64) {
 	defer rows.Close()
 
 	type History struct {
-		Time           time.Time `json:"time"`
-		Power          int       `json:"power"`
-		BatteryVoltage float64   `json:"battery_voltage"`
-		PvInputPower   int       `json:"pv_input_power"`
+		Time                      time.Time `json:"time"`
+		AcOutputActivePower       int       `json:"ac_output_active_power"`
+		AcOutputApparentPower     int       `json:"ac_output_apparent_power"`
+		AcOutputLoad              int       `json:"ac_output_load"`
+		BatteryCapacity           int       `json:"battery_capacity"`
+		BatteryVoltage            float64   `json:"battery_voltage"`
+		BatteryChargingCurrent    int       `json:"battery_charging_current"`
+		BatteryDischargeCurrent   int       `json:"battery_discharge_current"`
+		PvInputPower              int       `json:"pv_input_power"`
+		PvInputVoltage            float64   `json:"pv_input_voltage"`
+		PvInputCurrentForBattery  float64   `json:"pv_input_current_for_battery"`
+		AcInputVoltage            float64   `json:"ac_input_voltage"`
+		AcInputFrequency          float64   `json:"ac_input_frequency"`
+		InverterHeatSinkTemp      int       `json:"inverter_heat_sink_temperature"`
+		Pv2InputCurrent  		  float64   `json:"pv2_input_current"`
+		Pv2InputVoltage  		  float64   `json:"pv2_input_voltage"`
+		Pv2ChargingPower          int       `json:"pv2_charging_power"`
 	}
 
-	var result []History
+	result := make([]History, 0)
 
 	for rows.Next() {
 		var h History
-		if err := rows.Scan(&h.Time, &h.Power, &h.BatteryVoltage, &h.PvInputPower); err != nil {
+		if err := rows.Scan(
+			&h.Time,
+			&h.AcOutputActivePower,
+			&h.AcOutputApparentPower,
+			&h.AcOutputLoad,
+			&h.BatteryCapacity,
+			&h.BatteryVoltage,
+			&h.BatteryChargingCurrent,
+			&h.BatteryDischargeCurrent,	
+			&h.PvInputPower,
+			&h.PvInputVoltage,
+			&h.PvInputCurrentForBattery,
+			&h.AcInputVoltage,
+			&h.AcInputFrequency,
+			&h.InverterHeatSinkTemp,
+			&h.Pv2InputCurrent,
+			&h.Pv2InputVoltage,
+			&h.Pv2ChargingPower,
+		); err != nil {
 			continue
 		}
 		result = append(result, h)
