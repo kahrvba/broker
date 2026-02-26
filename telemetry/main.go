@@ -15,6 +15,8 @@ import (
 var (
 	dbPool *pgxpool.Pool
 
+	fixedSerial = "00202507001160"
+
 	serialCache = make(map[string]int64)
 	cacheMutex  sync.RWMutex
 
@@ -140,7 +142,7 @@ func main() {
 		log.Fatal(token.Error())
 	}
 
-	client.Subscribe("mpp/output/#", 0, messageHandler)
+	client.Subscribe("mpp/output/"+fixedSerial+"/#", 0, messageHandler)
 
 	log.Println("Collector running...")
 	select {}
@@ -181,49 +183,35 @@ func getInverterID(ctx context.Context, serial string) (int64, error) {
 
 func messageHandler(client mqtt.Client, msg mqtt.Message) {
 	ctx := context.Background()
+	id, err := getInverterID(ctx, fixedSerial)
+	if err != nil {
+		return
+	}
 
 	switch msg.Topic() {
 
-	case "mpp/output/qpigs":
-		var payload QpigsPayload
+	case "mpp/output/" + fixedSerial + "/qpigs":
+		var payload QpigsData
 		if err := json.Unmarshal(msg.Payload(), &payload); err != nil {
 			return
 		}
-		for serial, data := range payload {
-			id, err := getInverterID(ctx, serial)
-			if err != nil {
-				continue
-			}
-			addQpigsToBatch(id, data)
-			updateLatest(ctx, id, data)
-		}
+		addQpigsToBatch(id, payload)
+		updateLatest(ctx, id, payload)
 
-	case "mpp/output/qpigs2":
-		var payload Qpigs2Payload
+	case "mpp/output/" + fixedSerial + "/qpigs2":
+		var payload Qpigs2Data
 		if err := json.Unmarshal(msg.Payload(), &payload); err != nil {
 			return
 		}
-		for serial, data := range payload {
-			id, err := getInverterID(ctx, serial)
-			if err != nil {
-				continue
-			}
-			addQpigs2ToBatch(id, data)
-			updateLatestPv2(ctx, id, data)
-		}
+		addQpigs2ToBatch(id, payload)
+		updateLatestPv2(ctx, id, payload)
 
-	case "mpp/output/qpiws":
-		var payload QpiwsPayload
+	case "mpp/output/" + fixedSerial + "/qpiws":
+		var payload QpiwsData
 		if err := json.Unmarshal(msg.Payload(), &payload); err != nil {
 			return
 		}
-		for serial, data := range payload {
-			id, err := getInverterID(ctx, serial)
-			if err != nil {
-				continue
-			}
-			updateFaults(ctx, id, data)
-		}
+		updateFaults(ctx, id, payload)
 	}
 }
 
