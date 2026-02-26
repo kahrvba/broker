@@ -48,16 +48,16 @@ type QpigsData struct {
 	PvInputVoltage                   float64 `json:"pv_input_voltage"`
 	BatteryVoltageFromScc            float64 `json:"battery_voltage_from_scc"`
 	BatteryDischargeCurrent          int     `json:"battery_discharge_current"`
-	IsSbuPriorityVersionAdded        int     `json:"is_sbu_priority_version_added"`
-	IsConfigurationChanged           int     `json:"is_configuration_changed"`
-	IsSccFirmwareUpdated             int     `json:"is_scc_firmware_updated"`
-	IsLoadOn                         int     `json:"is_load_on"`
-	IsChargingOn                     int     `json:"is_charging_on"`
-	IsSccChargingOn                  int     `json:"is_scc_charging_on"`
-	IsAcChargingOn                   int     `json:"is_ac_charging_on"`
-	IsChargingToFloat                int     `json:"is_charging_to_float"`
-	IsSwitchedOn                     int     `json:"is_switched_on"`
-	IsReserved                       int     `json:"is_reserved"`
+	IsSbuPriorityVersionAdded        bool    `json:"is_sbu_priority_version_added"`
+	IsConfigurationChanged           bool    `json:"is_configuration_changed"`
+	IsSccFirmwareUpdated             bool    `json:"is_scc_firmware_updated"`
+	IsLoadOn                         bool    `json:"is_load_on"`
+	IsChargingOn                     bool    `json:"is_charging_on"`
+	IsSccChargingOn                  bool    `json:"is_scc_charging_on"`
+	IsAcChargingOn                   bool    `json:"is_ac_charging_on"`
+	IsChargingToFloat                bool    `json:"is_charging_to_float"`
+	IsSwitchedOn                     bool    `json:"is_switched_on"`
+	IsReserved                       bool    `json:"is_reserved"`
 	Rsv1                             int     `json:"rsv1"`
 	Rsv2                             int     `json:"rsv2"`
 	PvInputPower                     int     `json:"pv_input_power"`
@@ -67,7 +67,7 @@ type Qpigs2Payload map[string]Qpigs2Data
 type Qpigs2Data struct {
 	Pv2InputCurrent  float64 `json:"pv2_input_current"`
 	Pv2InputVoltage  float64 `json:"pv2_input_voltage"`
-	Pv2ChargingPower int     `json:"pv2_Charging_Power"`
+	Pv2ChargingPower int     `json:"pv2_charging_power"`
 }
 
 type QpiwsPayload map[string]QpiwsData
@@ -191,27 +191,39 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 	switch msg.Topic() {
 
 	case "mpp/output/" + fixedSerial + "/qpigs":
-		var payload QpigsData
+		var payload QpigsPayload
 		if err := json.Unmarshal(msg.Payload(), &payload); err != nil {
 			return
 		}
-		addQpigsToBatch(id, payload)
-		updateLatest(ctx, id, payload)
+		data, ok := payload[fixedSerial]
+		if !ok {
+			return
+		}
+		addQpigsToBatch(id, data)
+		updateLatest(ctx, id, data)
 
 	case "mpp/output/" + fixedSerial + "/qpigs2":
-		var payload Qpigs2Data
+		var payload Qpigs2Payload
 		if err := json.Unmarshal(msg.Payload(), &payload); err != nil {
 			return
 		}
-		addQpigs2ToBatch(id, payload)
-		updateLatestPv2(ctx, id, payload)
+		data, ok := payload[fixedSerial]
+		if !ok {
+			return
+		}
+		addQpigs2ToBatch(id, data)
+		updateLatestPv2(ctx, id, data)
 
 	case "mpp/output/" + fixedSerial + "/qpiws":
-		var payload QpiwsData
+		var payload QpiwsPayload
 		if err := json.Unmarshal(msg.Payload(), &payload); err != nil {
 			return
 		}
-		updateFaults(ctx, id, payload)
+		data, ok := payload[fixedSerial]
+		if !ok {
+			return
+		}
+		updateFaults(ctx, id, data)
 	}
 }
 
@@ -280,16 +292,16 @@ func flushBatch() {
 			r.PvInputCurrentForBattery, r.PvInputVoltage,
 			r.BatteryVoltageFromScc,
 			r.BatteryDischargeCurrent,
-			r.IsSbuPriorityVersionAdded == 1,
-			r.IsConfigurationChanged == 1,
-			r.IsSccFirmwareUpdated == 1,
-			r.IsLoadOn == 1,
-			r.IsChargingOn == 1,
-			r.IsSccChargingOn == 1,
-			r.IsAcChargingOn == 1,
-			r.IsChargingToFloat == 1,
-			r.IsSwitchedOn == 1,
-			r.IsReserved == 1,
+			r.IsSbuPriorityVersionAdded,
+			r.IsConfigurationChanged,
+			r.IsSccFirmwareUpdated,
+			r.IsLoadOn,
+			r.IsChargingOn,
+			r.IsSccChargingOn,
+			r.IsAcChargingOn,
+			r.IsChargingToFloat,
+			r.IsSwitchedOn,
+			r.IsReserved,
 			r.Rsv1, r.Rsv2,
 			r.PvInputPower,
 			r.Pv2InputCurrent,
@@ -360,11 +372,11 @@ func updateLatest(ctx context.Context, id int64, d QpigsData) {
 		d.AcOutputActivePower,
 		d.BatteryVoltage,
 		d.PvInputPower,
-		d.IsLoadOn == 1,
-		d.IsChargingOn == 1,
-		d.IsSccChargingOn == 1,
-		d.IsAcChargingOn == 1,
-		d.IsSwitchedOn == 1,
+		d.IsLoadOn,
+		d.IsChargingOn,
+		d.IsSccChargingOn,
+		d.IsAcChargingOn,
+		d.IsSwitchedOn,
 	)
 }
 
