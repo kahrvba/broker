@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,15 +16,12 @@ import (
 var (
 	dbPool *pgxpool.Pool
 
-	fixedSerial = "00202507001160"
-
 	serialCache = make(map[string]int64)
 	cacheMutex  sync.RWMutex
-
-	telemetryBatch []TelemetryInsert
-	batchMutex     sync.Mutex
-	batchSize      = 300
-	flushInterval  = 2 * time.Second
+	pendingTelemetry = make(map[int64]*TelemetryInsert)
+	batchMutex       sync.Mutex
+	batchSize        = 300
+	flushInterval    = 2 * time.Second
 )
 
 /* ========================
@@ -108,6 +106,7 @@ type QpiwsData struct {
 type TelemetryInsert struct {
 	Time       time.Time
 	InverterID int64
+	HasQpigs   bool
 	QpigsData
 	Pv2InputCurrent  float64
 	Pv2InputVoltage  float64
@@ -142,7 +141,9 @@ func main() {
 		log.Fatal(token.Error())
 	}
 
-	client.Subscribe("mpp/output/"+fixedSerial+"/#", 0, messageHandler)
+	if token := client.Subscribe("mpp/output/+/+", 0, messageHandler); token.Wait() && token.Error() != nil {
+		log.Fatal(token.Error())
+	}
 
 	log.Println("Collector running...")
 	select {}
@@ -183,48 +184,71 @@ func getInverterID(ctx context.Context, serial string) (int64, error) {
 
 func messageHandler(client mqtt.Client, msg mqtt.Message) {
 	ctx := context.Background()
-	id, err := getInverterID(ctx, fixedSerial)
+
+	serial, metric, ok := parseTopic(msg.Topic())
+	if !ok {
+		return
+	}
+
+	id, err := getInverterID(ctx, serial)
 	if err != nil {
 		return
 	}
 
-	switch msg.Topic() {
+	switch metric {
 
-	case "mpp/output/" + fixedSerial + "/qpigs":
+	case "qpigs":
 		var payload QpigsPayload
 		if err := json.Unmarshal(msg.Payload(), &payload); err != nil {
+			log.Println("Invalid qpigs payload:", err)
 			return
 		}
-		data, ok := payload[fixedSerial]
+		data, ok := payload[serial]
 		if !ok {
+			log.Println("Missing qpigs data for serial:", serial)
 			return
 		}
 		addQpigsToBatch(id, data)
 		updateLatest(ctx, id, data)
 
-	case "mpp/output/" + fixedSerial + "/qpigs2":
+	case "qpigs2":
 		var payload Qpigs2Payload
 		if err := json.Unmarshal(msg.Payload(), &payload); err != nil {
+			log.Println("Invalid qpigs2 payload:", err)
 			return
 		}
-		data, ok := payload[fixedSerial]
+		data, ok := payload[serial]
 		if !ok {
+			log.Println("Missing qpigs2 data for serial:", serial)
 			return
 		}
 		addQpigs2ToBatch(id, data)
 		updateLatestPv2(ctx, id, data)
 
-	case "mpp/output/" + fixedSerial + "/qpiws":
+	case "qpiws":
 		var payload QpiwsPayload
 		if err := json.Unmarshal(msg.Payload(), &payload); err != nil {
+			log.Println("Invalid qpiws payload:", err)
 			return
 		}
-		data, ok := payload[fixedSerial]
+		data, ok := payload[serial]
 		if !ok {
+			log.Println("Missing qpiws data for serial:", serial)
 			return
 		}
 		updateFaults(ctx, id, data)
 	}
+}
+
+func parseTopic(topic string) (serial string, metric string, ok bool) {
+	parts := strings.Split(topic, "/")
+	if len(parts) != 4 {
+		return "", "", false
+	}
+	if parts[0] != "mpp" || parts[1] != "output" || parts[2] == "" || parts[3] == "" {
+		return "", "", false
+	}
+	return parts[2], parts[3], true
 }
 
 /* ========================
@@ -232,15 +256,16 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 ======================== */
 
 func addQpigsToBatch(id int64, d QpigsData) {
-	row := TelemetryInsert{
-		Time:       time.Now(),
-		InverterID: id,
-		QpigsData:  d,
-	}
-
 	batchMutex.Lock()
-	telemetryBatch = append(telemetryBatch, row)
-	if len(telemetryBatch) >= batchSize {
+	row, ok := pendingTelemetry[id]
+	if !ok {
+		row = &TelemetryInsert{InverterID: id}
+		pendingTelemetry[id] = row
+	}
+	row.Time = time.Now()
+	row.HasQpigs = true
+	row.QpigsData = d
+	if len(pendingTelemetry) >= batchSize {
 		go flushBatch()
 	}
 	batchMutex.Unlock()
@@ -248,14 +273,17 @@ func addQpigsToBatch(id int64, d QpigsData) {
 
 func addQpigs2ToBatch(id int64, d Qpigs2Data) {
 	batchMutex.Lock()
-	for i := range telemetryBatch {
-		if telemetryBatch[i].InverterID == id {
-			telemetryBatch[i].Pv2InputCurrent = d.Pv2InputCurrent
-			telemetryBatch[i].Pv2InputVoltage = d.Pv2InputVoltage
-			telemetryBatch[i].Pv2ChargingPower = d.Pv2ChargingPower
-			break
-		}
+	row, ok := pendingTelemetry[id]
+	if !ok {
+		row = &TelemetryInsert{InverterID: id}
+		pendingTelemetry[id] = row
 	}
+	if row.Time.IsZero() {
+		row.Time = time.Now()
+	}
+	row.Pv2InputCurrent = d.Pv2InputCurrent
+	row.Pv2InputVoltage = d.Pv2InputVoltage
+	row.Pv2ChargingPower = d.Pv2ChargingPower
 	batchMutex.Unlock()
 }
 
@@ -268,8 +296,16 @@ func batchFlusher() {
 
 func flushBatch() {
 	batchMutex.Lock()
-	rows := telemetryBatch
-	telemetryBatch = nil
+	rows := make([]TelemetryInsert, 0, len(pendingTelemetry))
+	remaining := make(map[int64]*TelemetryInsert)
+	for id, row := range pendingTelemetry {
+		if row.HasQpigs {
+			rows = append(rows, *row)
+			continue
+		}
+		remaining[id] = row
+	}
+	pendingTelemetry = remaining
 	batchMutex.Unlock()
 
 	if len(rows) == 0 {
