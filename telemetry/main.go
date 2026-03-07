@@ -18,11 +18,16 @@ var (
 
 	serialCache = make(map[string]int64)
 	cacheMutex  sync.RWMutex
-	pendingTelemetry = make(map[int64]*TelemetryInsert)
-	batchMutex       sync.Mutex
-	batchSize        = 300
-	flushInterval    = 2 * time.Second
+
+	telemetryBatch = make([]TelemetryInsert, 0, 300)
+	latestPv2      = make(map[int64]pv2Snapshot)
+	lastBatchIndex = make(map[int64]int)
+	batchMutex     sync.Mutex
+	batchSize      = 300
+	flushInterval  = 2 * time.Second
 )
+
+const pv2FreshnessWindow = 5 * time.Second
 
 /* ========================
    JSON STRUCTS
@@ -82,7 +87,9 @@ type QpiwsData struct {
 	FanLockedFault                int `json:"fan_locked_fault"`
 	BatteryVoltageTooHighFault    int `json:"battery_voltage_too_high_fault"`
 	BatteryLowAlarmWarning        int `json:"battery_low_alarm_warning"`
+	Reserved13                    int `json:"reserved_13"`
 	BatteryUnderShutdownWarning   int `json:"battery_under_shutdown_warning"`
+	Reserved15                    int `json:"reserved_15"`
 	OverloadFault                 int `json:"overload_fault"`
 	EepromFault                   int `json:"eeprom_fault"`
 	InverterOverCurrentFault      int `json:"inverter_over_current_fault"`
@@ -96,7 +103,9 @@ type QpiwsData struct {
 	PvVoltageHighWarning          int `json:"pv_voltage_high_warning"`
 	MpptOverloadFault             int `json:"mppt_overload_fault"`
 	MpptOverloadWarning           int `json:"mppt_overload_warning"`
-	Reserved                      int `json:"reserved"`
+	BatteryTooLowToChargeWarning  int `json:"battery_too_low_to_charge_warning"`
+	Reserved30                    int `json:"reserved_30"`
+	Reserved31                    int `json:"reserved_31"`
 }
 
 /* ========================
@@ -106,11 +115,15 @@ type QpiwsData struct {
 type TelemetryInsert struct {
 	Time       time.Time
 	InverterID int64
-	HasQpigs   bool
 	QpigsData
 	Pv2InputCurrent  float64
 	Pv2InputVoltage  float64
 	Pv2ChargingPower int
+}
+
+type pv2Snapshot struct {
+	Data      Qpigs2Data
+	UpdatedAt time.Time
 }
 
 /* ========================
@@ -128,6 +141,10 @@ func main() {
 	}
 	dbPool = pool
 	defer dbPool.Close()
+
+	if err := ensureSchema(ctx); err != nil {
+		log.Fatal(err)
+	}
 
 	go batchFlusher()
 
@@ -178,6 +195,28 @@ func getInverterID(ctx context.Context, serial string) (int64, error) {
 	return id, nil
 }
 
+func ensureSchema(ctx context.Context) error {
+	_, err := dbPool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS mqtt_messages (
+			id BIGSERIAL PRIMARY KEY,
+			received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			inverter_id BIGINT NOT NULL REFERENCES inverters(id) ON DELETE CASCADE,
+			serial TEXT NOT NULL,
+			metric TEXT NOT NULL,
+			topic TEXT NOT NULL,
+			raw_payload TEXT NOT NULL,
+			payload_json JSONB
+		);
+
+		CREATE INDEX IF NOT EXISTS mqtt_messages_inverter_time_idx
+			ON mqtt_messages (inverter_id, received_at DESC);
+
+		CREATE INDEX IF NOT EXISTS mqtt_messages_metric_time_idx
+			ON mqtt_messages (metric, received_at DESC);
+	`)
+	return err
+}
+
 /* ========================
    MESSAGE HANDLER
 ======================== */
@@ -194,6 +233,8 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 	if err != nil {
 		return
 	}
+
+	saveRawMessage(ctx, id, serial, metric, msg.Topic(), msg.Payload())
 
 	switch metric {
 
@@ -223,6 +264,7 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 			return
 		}
 		addQpigs2ToBatch(id, data)
+		updateRecentTelemetryPv2(ctx, id, data)
 		updateLatestPv2(ctx, id, data)
 
 	case "qpiws":
@@ -237,6 +279,25 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 			return
 		}
 		updateFaults(ctx, id, data)
+	}
+}
+
+func saveRawMessage(ctx context.Context, id int64, serial, metric, topic string, payload []byte) {
+	var payloadJSON any
+	if json.Valid(payload) {
+		if err := json.Unmarshal(payload, &payloadJSON); err != nil {
+			log.Println("Failed to normalize raw payload:", err)
+			payloadJSON = nil
+		}
+	}
+
+	_, err := dbPool.Exec(ctx,
+		`INSERT INTO mqtt_messages (inverter_id, serial, metric, topic, raw_payload, payload_json)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		id, serial, metric, topic, payload, payloadJSON,
+	)
+	if err != nil {
+		log.Println("Raw MQTT insert error:", err)
 	}
 }
 
@@ -257,33 +318,37 @@ func parseTopic(topic string) (serial string, metric string, ok bool) {
 
 func addQpigsToBatch(id int64, d QpigsData) {
 	batchMutex.Lock()
-	row, ok := pendingTelemetry[id]
-	if !ok {
-		row = &TelemetryInsert{InverterID: id}
-		pendingTelemetry[id] = row
+	row := TelemetryInsert{
+		Time:       time.Now(),
+		InverterID: id,
+		QpigsData:  d,
 	}
-	row.Time = time.Now()
-	row.HasQpigs = true
-	row.QpigsData = d
-	if len(pendingTelemetry) >= batchSize {
-		go flushBatch()
+	if pv2, ok := latestPv2[id]; ok && row.Time.Sub(pv2.UpdatedAt) <= pv2FreshnessWindow {
+		row.Pv2InputCurrent = pv2.Data.Pv2InputCurrent
+		row.Pv2InputVoltage = pv2.Data.Pv2InputVoltage
+		row.Pv2ChargingPower = pv2.Data.Pv2ChargingPower
 	}
+	telemetryBatch = append(telemetryBatch, row)
+	lastBatchIndex[id] = len(telemetryBatch) - 1
+	shouldFlush := len(telemetryBatch) >= batchSize
 	batchMutex.Unlock()
+
+	if shouldFlush {
+		flushBatch()
+	}
 }
 
 func addQpigs2ToBatch(id int64, d Qpigs2Data) {
 	batchMutex.Lock()
-	row, ok := pendingTelemetry[id]
-	if !ok {
-		row = &TelemetryInsert{InverterID: id}
-		pendingTelemetry[id] = row
+	latestPv2[id] = pv2Snapshot{
+		Data:      d,
+		UpdatedAt: time.Now(),
 	}
-	if row.Time.IsZero() {
-		row.Time = time.Now()
+	if idx, ok := lastBatchIndex[id]; ok && idx >= 0 && idx < len(telemetryBatch) && telemetryBatch[idx].InverterID == id {
+		telemetryBatch[idx].Pv2InputCurrent = d.Pv2InputCurrent
+		telemetryBatch[idx].Pv2InputVoltage = d.Pv2InputVoltage
+		telemetryBatch[idx].Pv2ChargingPower = d.Pv2ChargingPower
 	}
-	row.Pv2InputCurrent = d.Pv2InputCurrent
-	row.Pv2InputVoltage = d.Pv2InputVoltage
-	row.Pv2ChargingPower = d.Pv2ChargingPower
 	batchMutex.Unlock()
 }
 
@@ -296,16 +361,9 @@ func batchFlusher() {
 
 func flushBatch() {
 	batchMutex.Lock()
-	rows := make([]TelemetryInsert, 0, len(pendingTelemetry))
-	remaining := make(map[int64]*TelemetryInsert)
-	for id, row := range pendingTelemetry {
-		if row.HasQpigs {
-			rows = append(rows, *row)
-			continue
-		}
-		remaining[id] = row
-	}
-	pendingTelemetry = remaining
+	rows := telemetryBatch
+	telemetryBatch = make([]TelemetryInsert, 0, batchSize)
+	lastBatchIndex = make(map[int64]int)
 	batchMutex.Unlock()
 
 	if len(rows) == 0 {
@@ -381,6 +439,20 @@ func flushBatch() {
 
 	if err != nil {
 		log.Println("Batch insert error:", err)
+		batchMutex.Lock()
+		rebuilt := make([]TelemetryInsert, 0, len(rows)+len(telemetryBatch))
+		rebuilt = append(rebuilt, rows...)
+		rebuilt = append(rebuilt, telemetryBatch...)
+		telemetryBatch = rebuilt
+		rebuildLastBatchIndexLocked()
+		batchMutex.Unlock()
+	}
+}
+
+func rebuildLastBatchIndexLocked() {
+	lastBatchIndex = make(map[int64]int, len(telemetryBatch))
+	for i, row := range telemetryBatch {
+		lastBatchIndex[row.InverterID] = i
 	}
 }
 
@@ -418,10 +490,32 @@ func updateLatest(ctx context.Context, id int64, d QpigsData) {
 
 func updateLatestPv2(ctx context.Context, id int64, d Qpigs2Data) {
 	_, _ = dbPool.Exec(ctx,
-		`UPDATE inverter_latest
-		SET pv2_charging_power=$1,time=$2
-		WHERE inverter_id=$3`,
-		d.Pv2ChargingPower, time.Now(), id)
+		`INSERT INTO inverter_latest (inverter_id, time, pv2_charging_power)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (inverter_id) DO UPDATE SET
+		time=EXCLUDED.time,
+		pv2_charging_power=EXCLUDED.pv2_charging_power`,
+		id, time.Now(), d.Pv2ChargingPower)
+}
+
+func updateRecentTelemetryPv2(ctx context.Context, id int64, d Qpigs2Data) {
+	_, _ = dbPool.Exec(ctx,
+		`WITH latest AS (
+			SELECT ctid
+			FROM telemetry
+			WHERE inverter_id=$1
+			  AND time >= NOW() - INTERVAL '15 seconds'
+			ORDER BY time DESC
+			LIMIT 1
+		)
+		UPDATE telemetry t
+		SET pv2_input_current=$2,
+		    pv2_input_voltage=$3,
+		    pv2_charging_power=$4
+		FROM latest
+		WHERE t.ctid = latest.ctid`,
+		id, d.Pv2InputCurrent, d.Pv2InputVoltage, d.Pv2ChargingPower,
+	)
 }
 
 func updateFaults(ctx context.Context, id int64, d QpiwsData) {
@@ -432,18 +526,18 @@ func updateFaults(ctx context.Context, id int64, d QpiwsData) {
 		line_fail_warning,opv_short_warning,
 		inverter_voltage_too_low_fault,inverter_voltage_too_high_fault,
 		over_temperature_fault,fan_locked_fault,
-		battery_voltage_too_high_fault,battery_low_alarm_warning,
-		battery_under_shutdown_warning,overload_fault,eeprom_fault,
+		battery_voltage_too_high_fault,battery_low_alarm_warning,reserved_13,
+		battery_under_shutdown_warning,reserved_15,overload_fault,eeprom_fault,
 		inverter_over_current_fault,inverter_soft_fail_fault,
 		self_test_fail_fault,op_dc_voltage_over_fault,
 		battery_open_fault,current_sensor_fail_fault,
 		battery_short_fault,power_limit_warning,
 		pv_voltage_high_warning,mppt_overload_fault,
-		mppt_overload_warning,reserved)
+		mppt_overload_warning,battery_too_low_to_charge_warning,reserved_30,reserved_31)
 		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
 		       $11,$12,$13,$14,$15,$16,$17,$18,
 		       $19,$20,$21,$22,$23,$24,$25,$26,
-		       $27,$28,$29)
+		       $27,$28,$29,$30,$31,$32)
 		ON CONFLICT (inverter_id) DO UPDATE SET
 		time=EXCLUDED.time,
 		inverter_fault=EXCLUDED.inverter_fault,
@@ -458,7 +552,9 @@ func updateFaults(ctx context.Context, id int64, d QpiwsData) {
 		fan_locked_fault=EXCLUDED.fan_locked_fault,
 		battery_voltage_too_high_fault=EXCLUDED.battery_voltage_too_high_fault,
 		battery_low_alarm_warning=EXCLUDED.battery_low_alarm_warning,
+		reserved_13=EXCLUDED.reserved_13,
 		battery_under_shutdown_warning=EXCLUDED.battery_under_shutdown_warning,
+		reserved_15=EXCLUDED.reserved_15,
 		overload_fault=EXCLUDED.overload_fault,
 		eeprom_fault=EXCLUDED.eeprom_fault,
 		inverter_over_current_fault=EXCLUDED.inverter_over_current_fault,
@@ -472,7 +568,9 @@ func updateFaults(ctx context.Context, id int64, d QpiwsData) {
 		pv_voltage_high_warning=EXCLUDED.pv_voltage_high_warning,
 		mppt_overload_fault=EXCLUDED.mppt_overload_fault,
 		mppt_overload_warning=EXCLUDED.mppt_overload_warning,
-		reserved=EXCLUDED.reserved`,
+		battery_too_low_to_charge_warning=EXCLUDED.battery_too_low_to_charge_warning,
+		reserved_30=EXCLUDED.reserved_30,
+		reserved_31=EXCLUDED.reserved_31`,
 		id, time.Now(),
 		d.InverterFault == 1,
 		d.BusOverFault == 1,
@@ -486,7 +584,9 @@ func updateFaults(ctx context.Context, id int64, d QpiwsData) {
 		d.FanLockedFault == 1,
 		d.BatteryVoltageTooHighFault == 1,
 		d.BatteryLowAlarmWarning == 1,
+		d.Reserved13 == 1,
 		d.BatteryUnderShutdownWarning == 1,
+		d.Reserved15 == 1,
 		d.OverloadFault == 1,
 		d.EepromFault == 1,
 		d.InverterOverCurrentFault == 1,
@@ -500,6 +600,8 @@ func updateFaults(ctx context.Context, id int64, d QpiwsData) {
 		d.PvVoltageHighWarning == 1,
 		d.MpptOverloadFault == 1,
 		d.MpptOverloadWarning == 1,
-		d.Reserved == 1,
+		d.BatteryTooLowToChargeWarning == 1,
+		d.Reserved30 == 1,
+		d.Reserved31 == 1,
 	)
 }

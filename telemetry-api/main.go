@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -230,36 +231,19 @@ func getQpigs(w http.ResponseWriter, id int64) {
 
 func getHistory(w http.ResponseWriter, r *http.Request, id int64) {
 
-	limit := 10000
+	limit := 0
 	if l := r.URL.Query().Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
 			limit = parsed
 		}
 	}
 
-	rows, err := db.Query(context.Background(),
-		`SELECT time,
-		        ac_output_active_power,
-		        ac_output_apparent_power,
-		        ac_output_load,
-		        battery_capacity,
-		        battery_voltage,
-		        battery_charging_current,
-		        battery_discharge_current,
-		        pv_input_power,
-		        pv_input_voltage,
-		        pv_input_current_for_battery,
-		        ac_input_voltage,
-		        ac_input_frequency,
-		        inverter_heat_sink_temperature,
-				pv2_input_current,
-        		pv2_input_voltage,
-        		pv2_charging_power
-		 FROM telemetry
-		 WHERE inverter_id=$1
-		 ORDER BY time DESC
-		 LIMIT $2`,
-		id, limit)
+	query, args, err := buildHistoryQuery(id, r, limit)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	rows, err := db.Query(context.Background(), query, args...)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -317,6 +301,189 @@ func getHistory(w http.ResponseWriter, r *http.Request, id int64) {
 	json.NewEncoder(w).Encode(result)
 }
 
+func buildHistoryQuery(id int64, r *http.Request, limit int) (string, []interface{}, error) {
+	start, end, err := parseHistoryRange(r)
+	if err != nil {
+		return "", nil, err
+	}
+
+	query := `SELECT time,
+		        ac_output_active_power,
+		        ac_output_apparent_power,
+		        ac_output_load,
+		        battery_capacity,
+		        battery_voltage,
+		        battery_charging_current,
+		        battery_discharge_current,
+		        pv_input_power,
+		        pv_input_voltage,
+		        pv_input_current_for_battery,
+		        ac_input_voltage,
+		        ac_input_frequency,
+		        inverter_heat_sink_temperature,
+				pv2_input_current,
+        		pv2_input_voltage,
+        		pv2_charging_power
+		 FROM telemetry
+		 WHERE inverter_id=$1`
+
+	args := []interface{}{id}
+	argPos := 2
+
+	if !start.IsZero() {
+		query += " AND time >= $" + strconv.Itoa(argPos)
+		args = append(args, start)
+		argPos++
+	}
+
+	if !end.IsZero() {
+		query += " AND time < $" + strconv.Itoa(argPos)
+		args = append(args, end)
+		argPos++
+	}
+
+	query += " ORDER BY time DESC"
+	if limit > 0 {
+		query += " LIMIT $" + strconv.Itoa(argPos)
+		args = append(args, limit)
+	}
+
+	return query, args, nil
+}
+
+func parseHistoryRange(r *http.Request) (time.Time, time.Time, error) {
+	q := r.URL.Query()
+	now := time.Now()
+
+	if day := q.Get("day"); day != "" {
+		start, err := parseDayValue(day, now)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		return start, start.AddDate(0, 0, 1), nil
+	}
+
+	if month := q.Get("month"); month != "" {
+		start, err := parseMonthValue(month, q.Get("year"), now)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		return start, start.AddDate(0, 1, 0), nil
+	}
+
+	if year := q.Get("year"); year != "" {
+		start, err := parseYearValue(year, now)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		return start, start.AddDate(1, 0, 0), nil
+	}
+
+	return time.Time{}, time.Time{}, nil
+}
+
+func parseDayValue(value string, now time.Time) (time.Time, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+
+	switch value {
+	case "today":
+		return startOfDay(now), nil
+	case "yesterday":
+		return startOfDay(now).AddDate(0, 0, -1), nil
+	}
+
+	if t, err := time.ParseInLocation("2006-01-02", value, now.Location()); err == nil {
+		return t, nil
+	}
+
+	weekdays := map[string]time.Weekday{
+		"sunday": time.Sunday, "sun": time.Sunday,
+		"monday": time.Monday, "mon": time.Monday,
+		"tuesday": time.Tuesday, "tue": time.Tuesday, "tues": time.Tuesday,
+		"wednesday": time.Wednesday, "wed": time.Wednesday,
+		"thursday": time.Thursday, "thu": time.Thursday, "thurs": time.Thursday,
+		"friday": time.Friday, "fri": time.Friday,
+		"saturday": time.Saturday, "sat": time.Saturday,
+	}
+
+	target, ok := weekdays[value]
+	if !ok {
+		return time.Time{}, fmt.Errorf("invalid day value")
+	}
+
+	start := startOfDay(now)
+	diff := (7 + int(start.Weekday()) - int(target)) % 7
+	return start.AddDate(0, 0, -diff), nil
+}
+
+func parseMonthValue(value, year string, now time.Time) (time.Time, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+
+	switch value {
+	case "this":
+		return time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()), nil
+	case "last":
+		lastMonth := now.AddDate(0, -1, 0)
+		return time.Date(lastMonth.Year(), lastMonth.Month(), 1, 0, 0, 0, 0, now.Location()), nil
+	}
+
+	if t, err := time.ParseInLocation("2006-01", value, now.Location()); err == nil {
+		return t, nil
+	}
+
+	monthNames := map[string]time.Month{
+		"january": time.January, "jan": time.January,
+		"february": time.February, "feb": time.February,
+		"march": time.March, "mar": time.March,
+		"april": time.April, "apr": time.April,
+		"may": time.May,
+		"june": time.June, "jun": time.June,
+		"july": time.July, "jul": time.July,
+		"august": time.August, "aug": time.August,
+		"september": time.September, "sep": time.September, "sept": time.September,
+		"october": time.October, "oct": time.October,
+		"november": time.November, "nov": time.November,
+		"december": time.December, "dec": time.December,
+	}
+
+	month, ok := monthNames[value]
+	if !ok {
+		return time.Time{}, fmt.Errorf("invalid month value")
+	}
+
+	targetYear := now.Year()
+	if year != "" {
+		parsedYear, err := strconv.Atoi(year)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("invalid year value")
+		}
+		targetYear = parsedYear
+	}
+
+	return time.Date(targetYear, month, 1, 0, 0, 0, 0, now.Location()), nil
+}
+
+func startOfDay(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+}
+
+func parseYearValue(value string, now time.Time) (time.Time, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+
+	switch value {
+	case "this":
+		return time.Date(now.Year(), time.January, 1, 0, 0, 0, 0, now.Location()), nil
+	case "last":
+		return time.Date(now.Year()-1, time.January, 1, 0, 0, 0, 0, now.Location()), nil
+	}
+
+	year, err := strconv.Atoi(value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid year value")
+	}
+	return time.Date(year, time.January, 1, 0, 0, 0, 0, now.Location()), nil
+}
+
 /* ========================
    FAULTS
 ======================== */
@@ -337,7 +504,9 @@ func getFaults(w http.ResponseWriter, id int64) {
 		FanLockedFault           bool      `json:"fan_locked_fault"`
 		BatteryVoltageTooHigh    bool      `json:"battery_voltage_too_high_fault"`
 		BatteryLowAlarmWarning   bool      `json:"battery_low_alarm_warning"`
+		Reserved13              bool      `json:"reserved_13"`
 		BatteryUnderShutdown     bool      `json:"battery_under_shutdown_warning"`
+		Reserved15              bool      `json:"reserved_15"`
 		OverloadFault            bool      `json:"overload_fault"`
 		EepromFault              bool      `json:"eeprom_fault"`
 		InverterOverCurrentFault bool      `json:"inverter_over_current_fault"`
@@ -351,7 +520,9 @@ func getFaults(w http.ResponseWriter, id int64) {
 		PvVoltageHighWarning     bool      `json:"pv_voltage_high_warning"`
 		MpptOverloadFault        bool      `json:"mppt_overload_fault"`
 		MpptOverloadWarning      bool      `json:"mppt_overload_warning"`
-		Reserved                 bool      `json:"reserved"`
+		BatteryTooLowToCharge    bool      `json:"battery_too_low_to_charge_warning"`
+		Reserved30              bool      `json:"reserved_30"`
+		Reserved31              bool      `json:"reserved_31"`
 	}
 
 	var f Faults
@@ -370,7 +541,9 @@ func getFaults(w http.ResponseWriter, id int64) {
 		        fan_locked_fault,
 		        battery_voltage_too_high_fault,
 		        battery_low_alarm_warning,
+		        reserved_13,
 		        battery_under_shutdown_warning,
+		        reserved_15,
 		        overload_fault,
 		        eeprom_fault,
 		        inverter_over_current_fault,
@@ -384,7 +557,9 @@ func getFaults(w http.ResponseWriter, id int64) {
 		        pv_voltage_high_warning,
 		        mppt_overload_fault,
 		        mppt_overload_warning,
-		        reserved
+		        battery_too_low_to_charge_warning,
+		        reserved_30,
+		        reserved_31
 		 FROM inverter_faults
 		 WHERE inverter_id=$1`,
 		id,
@@ -402,7 +577,9 @@ func getFaults(w http.ResponseWriter, id int64) {
 		&f.FanLockedFault,
 		&f.BatteryVoltageTooHigh,
 		&f.BatteryLowAlarmWarning,
+		&f.Reserved13,
 		&f.BatteryUnderShutdown,
+		&f.Reserved15,
 		&f.OverloadFault,
 		&f.EepromFault,
 		&f.InverterOverCurrentFault,
@@ -416,7 +593,9 @@ func getFaults(w http.ResponseWriter, id int64) {
 		&f.PvVoltageHighWarning,
 		&f.MpptOverloadFault,
 		&f.MpptOverloadWarning,
-		&f.Reserved,
+		&f.BatteryTooLowToCharge,
+		&f.Reserved30,
+		&f.Reserved31,
 	)
 
 	if err != nil {
